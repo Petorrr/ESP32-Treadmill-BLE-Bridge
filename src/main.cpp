@@ -260,20 +260,34 @@ class TreadmillClientCallbacks : public NimBLEClientCallbacks {
 };
 
 // =============================================================================
-// BLE Scan callback — filters by treadmill MAC address
+// BLE Scan callback — Find FTMS profile on treadmill, store address, and trigger connection
 // =============================================================================
 class ScanCallbacks : public NimBLEAdvertisedDeviceCallbacks {
-    void onResult(NimBLEAdvertisedDevice* device) override {
-        if (device->getAddress().toString() != TREADMILL_MAC) return;
+  void onResult(NimBLEAdvertisedDevice* device) override {
 
-        Serial.printf("[B%d][SCAN] Treadmill found by MAC — stopping scan.\n", ESP32_BUILD);
-        NimBLEDevice::getScan()->stop();
-
-        // Store ADDRESS, not the device pointer.
-        // The pointer becomes invalid after scan buffer is reused on next scan.
-        treadmillAddress = device->getAddress();
-        doConnect = true;
+    // Look for a Fitness Machine advertising the standard FTMS service.
+    if (!device->isAdvertisingService(NimBLEUUID(FTMS_SERVICE_UUID))) {
+      return;
     }
+
+    Serial.printf(
+      "[B%d][SCAN] FTMS treadmill found: %s\n",
+      ESP32_BUILD,
+      device->getName().c_str()
+    );
+
+    Serial.printf(
+      "[B%d][SCAN] Address: %s\n",
+      ESP32_BUILD,
+      device->getAddress().toString().c_str()
+    );
+
+    NimBLEDevice::getScan()->stop();
+
+    // Store the address only for this connection attempt.
+    treadmillAddress = device->getAddress();
+    doConnect = true;
+  }
 };
 
 // =============================================================================
