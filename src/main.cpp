@@ -1,4 +1,8 @@
 // main.cpp — ESP32 Treadmill BLE Bridge BUILD 12
+// Changes from BUILD 12:
+//      Added support for Dionysis RUN500 treadmill (FTMS + FitShow) — see platformio.ini for board selection.
+//      Running on an ESP32-C3 SuperMini, the bridge exposes a BLE Speed and Cadence sensor profile to the watch (instead of FTMS proxy).
+
 // Changes from BUILD 11:
 //   [FIX] Step counter new-session detection improved.
 //         BUILD 11 relied on "60s of zeros" but FitShow holds the last non-zero
@@ -12,7 +16,13 @@
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 
-#define ESP32_BUILD 12
+#define ESP32_BUILD 13
+#define LED_PIN     8
+
+#define RSC_SERVICE_UUID        "1814"
+#define RSC_MEASUREMENT_UUID    "2A53"
+#define RSC_FEATURE_UUID        "2A54"
+#define RSC_SENSOR_LOCATION_UUID "2A5D"
 
 // ── Treadmill identity ──────────────────────────────────────────────────────
 // EXILE TREX SPORT TX-400WP — random static BLE address
@@ -35,6 +45,7 @@ static NimBLEAddress         treadmillAddress;        // copied from scan result
 static volatile bool         doConnect          = false;
 static volatile bool         treadmillConnected = false;
 static volatile bool         watchConnected     = false;
+static NimBLECharacteristic* rscMeasurementChar = nullptr;  // Garmin RSC notify char
 
 // ── Treadmill data (written in callbacks, read in sendToWatch) ───────────────
 static uint16_t gRawSpeed    = 0;   // 0.01 km/h resolution (from FTMS 0x2ACD)
@@ -75,6 +86,45 @@ void sendToWatch() {
 
     p2acdChar->setValue(pkt, sizeof(pkt));
     p2acdChar->notify();
+}
+
+
+void sendRscMeasurement() {
+    if (!rscMeasurementChar) {
+        return;
+    }
+
+    // FTMS speed: 0.01 km/h
+    float speedKmh = gRawSpeed * 0.01f;
+
+    // RSC speed: 1/256 m/s
+    uint16_t speedRaw =
+        (uint16_t)round((speedKmh / 3.6f) * 256.0f);
+
+    // RSC total distance: 0.1 meter
+    uint32_t distanceRaw = gDistanceM * 10;
+
+    uint8_t data[8];
+
+    // Flags:
+    // bit 1 = Total Distance Present
+    data[0] = 0x02;
+
+    // Instantaneous Speed
+    data[1] = speedRaw & 0xFF;
+    data[2] = (speedRaw >> 8) & 0xFF;
+
+    // Instantaneous Cadence
+    data[3] = 0;
+
+    // Total Distance
+    data[4] = distanceRaw & 0xFF;
+    data[5] = (distanceRaw >> 8) & 0xFF;
+    data[6] = (distanceRaw >> 16) & 0xFF;
+    data[7] = (distanceRaw >> 24) & 0xFF;
+
+    rscMeasurementChar->setValue(data, sizeof(data));
+    rscMeasurementChar->notify();
 }
 
 // =============================================================================
@@ -386,10 +436,22 @@ bool connectToTreadmill() {
 // =============================================================================
 // GATT Server setup — FTMS proxy for CIQ DataField on the watch
 // =============================================================================
+#if 0
 void setupFtmsProxyServer() {
     NimBLEServer* pServer = NimBLEDevice::createServer();
     pServer->setCallbacks(new ServerCallbacks());
 
+    // ── RSC service — Garmin sensor interface ─────────────────────────────
+    NimBLEService* pRscSvc =
+    pServer->createService(RSC_SERVICE_UUID);
+
+    rscMeasurementChar = pRscSvc->createCharacteristic(
+    RSC_MEASUREMENT_UUID,
+    NIMBLE_PROPERTY::NOTIFY
+    );
+
+pRscSvc->start();
+#if 0
     NimBLEService* pSvc = pServer->createService(FTMS_SERVICE_UUID);
     p2acdChar = pSvc->createCharacteristic(
         TREADMILL_DATA_CHAR_UUID,
@@ -400,10 +462,12 @@ void setupFtmsProxyServer() {
     uint8_t zero[9] = {0};
     p2acdChar->setValue(zero, 9);
     pSvc->start();
+#endif
 
     // Advertise FTMS UUID so CIQ scan finds us via getServiceUuids()
     NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
-    pAdv->addServiceUUID(NimBLEUUID(FTMS_SERVICE_UUID));
+    //pAdv->addServiceUUID(NimBLEUUID(FTMS_SERVICE_UUID));
+    pAdv->addServiceUUID(NimBLEUUID(RSC_SERVICE_UUID));
 
     // "TreadBLE" = 8 chars — fits in BLE scan response without truncation.
     // Longer names (e.g. "TreadmillBridge") get truncated to ~8 chars by the stack.
@@ -416,11 +480,93 @@ void setupFtmsProxyServer() {
     Serial.printf("[B%d][GATT] FTMS proxy started. Address: %s\n",
         ESP32_BUILD, NimBLEDevice::getAddress().toString().c_str());
 }
+#endif
+
+// =============================================================================
+// GATT Server setup — minimal RSC sensor for Garmin
+// =============================================================================
+void setupFtmsProxyServer() {
+    NimBLEServer* pServer = NimBLEDevice::createServer();
+    pServer->setCallbacks(new ServerCallbacks());
+
+    // ── RSC Service ─────────────────────────────────────────────────────
+    NimBLEService* pRscSvc =
+        pServer->createService(RSC_SERVICE_UUID);
+
+    // RSC Measurement — notifications to Garmin
+    rscMeasurementChar = pRscSvc->createCharacteristic(
+        RSC_MEASUREMENT_UUID,
+        NIMBLE_PROPERTY::NOTIFY
+    );
+
+    // RSC Feature — minimal feature set
+    NimBLECharacteristic* pRscFeature =
+        pRscSvc->createCharacteristic(
+            RSC_FEATURE_UUID,
+            NIMBLE_PROPERTY::READ
+        );
+
+    uint8_t feature[2] = {
+        0x00, 0x00
+    };
+    pRscFeature->setValue(feature, sizeof(feature));
+
+    // Sensor Location — Foot
+    NimBLECharacteristic* pSensorLocation =
+        pRscSvc->createCharacteristic(
+            RSC_SENSOR_LOCATION_UUID,
+            NIMBLE_PROPERTY::READ
+        );
+
+    uint8_t location = 0x03;   // Foot
+    pSensorLocation->setValue(&location, 1);
+
+    pRscSvc->start();
+
+    // ── Advertising ────────────────────────────────────────────────────
+    NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
+
+    pAdv->addServiceUUID(NimBLEUUID(RSC_SERVICE_UUID));
+
+    NimBLEAdvertisementData scanResp;
+    scanResp.setName("TreadBLE");
+    pAdv->setScanResponseData(scanResp);
+
+    pAdv->start();
+
+    Serial.printf(
+        "[B%d][GATT] RSC sensor started. Address: %s\n",
+        ESP32_BUILD,
+        NimBLEDevice::getAddress().toString().c_str()
+    );
+}
+
+void sendTestRscMeasurement() {
+    if (!rscMeasurementChar) {
+        return;
+    }
+
+    // 2.30 km/h = 0.6389 m/s
+    // RSC resolution = 1/256 m/s
+    uint16_t speedRaw = 164;
+
+    uint8_t data[4];
+
+    data[0] = 0x00;                  // Flags
+    data[1] = speedRaw & 0xFF;       // Speed LSB
+    data[2] = speedRaw >> 8;         // Speed MSB
+    data[3] = 0;                     // Cadence
+
+    rscMeasurementChar->setValue(data, sizeof(data));
+    rscMeasurementChar->notify();
+}
 
 // =============================================================================
 // setup() — runs once at boot
 // =============================================================================
 void setup() {
+    pinMode(LED_PIN, OUTPUT);
+
     Serial.begin(115200);
     delay(1000);
 
@@ -450,6 +596,26 @@ void setup() {
 // loop() — main loop, handles deferred connection
 // =============================================================================
 void loop() {
+static uint32_t lastRsc = 0;
+
+    digitalWrite(LED_PIN, HIGH);
+ 
+
+    if (millis() - lastRsc >= 1000) {
+        lastRsc = millis();
+
+        if (watchConnected) {
+            sendRscMeasurement();
+
+            Serial.printf(
+                "[B%d][RSC] speed=%.2f km/h distance=%lu m\n",
+                ESP32_BUILD,
+                gRawSpeed * 0.01f,
+                (unsigned long)gDistanceM
+            );
+        }
+    }
+
     // doConnect is set by ScanCallbacks::onResult() in the NimBLE task.
     // We handle the actual connection here in the main task to avoid
     // blocking the NimBLE stack during GATT discovery.
@@ -461,4 +627,6 @@ void loop() {
         }
     }
     delay(10);
+    digitalWrite(LED_PIN, LOW);
 }
+ 
