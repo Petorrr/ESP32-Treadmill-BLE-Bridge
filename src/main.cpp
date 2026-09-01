@@ -1,3 +1,7 @@
+// main.cpp — ESP32 Treadmill BLE Bridge BUILD 14
+// Changes from BUILD 13:
+//
+
 // main.cpp — ESP32 Treadmill BLE Bridge BUILD 13
 // Changes from BUILD 12:
 //      Added support for FTMS + RSC sensor to Garmin watches
@@ -9,22 +13,15 @@
 //      Blue LED flashes slow (2 Hz) when treadmill is connected but watch is not
 //      Blue LED stays solid ON when bothtreadmill and watch are connected
 
-// Changes from BUILD 11 (Original from FitShow bridge fork):
-//   [FIX] Step counter new-session detection improved.
-//         BUILD 11 relied on "60s of zeros" but FitShow holds the last non-zero
-//         value when treadmill stops — zeros never arrive.
-//         New logic (two independent triggers):
-//           1. rawSteps jumps to 0 from a non-overflow value (gLastRawSteps < 9500)
-//              → immediate reset (new session started)
-//           2. rawSteps value frozen for 60s → reset (treadmill stopped)
-//         Overflow (9999→0→1) still detected: drop > 500 AND gLastRawSteps >= 9500.
+// Original copy from BUILD 11 (Original from FitShow bridge fork):
 
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 
 // ── Build configuration ─────────────────────────────────────────────────────
-#define ESP32_BUILD 13
-#define LED_PIN     8
+#define ESP32_BUILD     14
+#define LED_PIN         8
+#define CADENCE_FILTER  0.2f  // Low-pass filter alpha for cadence smoothing
 
 // ── Garmin RSC (Running Speed and Cadence) UUIDs ─────────────────────────
 #define RSC_SERVICE_UUID         "1814"
@@ -32,29 +29,15 @@
 #define RSC_FEATURE_UUID         "2A54"
 #define RSC_SENSOR_LOCATION_UUID "2A5D"
 
-// Default step length for treadmill speed → cadence conversion (meters per step).
-#define SLOW_PACE_STEP_LENGTH_M  0.50f
-#define FAST_PACE_STEP_LENGTH_M  1.15f
-#define MAX_SPEED_FOR_CADENCE    16.0f
-
-
-// ── Treadmill identity ──────────────────────────────────────────────────────
-// EXILE TREX SPORT TX-400WP — random static BLE address
-//static const char* TREADMILL_MAC = "e3:97:52:37:c6:30";
-
 // ── BLE UUIDs ────────────────────────────────────────────────────────────────
 static const char* FTMS_SERVICE_UUID        = "00001826-0000-1000-8000-00805f9b34fb";
 static const char* TREADMILL_DATA_CHAR_UUID = "00002acd-0000-1000-8000-00805f9b34fb";
 static const char* CCCD_UUID                = "00002902-0000-1000-8000-00805f9b34fb";
-// FitShow proprietary service — sends live data (incl. step count) on 0xFFF1
-static const char* FITSHOW_SERVICE_UUID     = "0000fff0-0000-1000-8000-00805f9b34fb";
-static const char* FITSHOW_NOTIFY_CHAR_UUID = "0000fff1-0000-1000-8000-00805f9b34fb";
 
 // ── Global state ─────────────────────────────────────────────────────────────
 // These flags are set in NimBLE callbacks (separate FreeRTOS task)
 // and read in loop() (main task) — volatile prevents compiler optimizations
-static NimBLEClient*         pClient     = nullptr;
-static NimBLECharacteristic* p2acdChar   = nullptr;  // server-side char for watch notifications
+static NimBLEClient*         pClient            = nullptr;
 static NimBLEAddress         treadmillAddress;        // copied from scan result (safe after rescan)
 static volatile bool         doConnect          = false;
 static volatile bool         treadmillConnected = false;
@@ -62,88 +45,59 @@ static volatile bool         watchConnected     = false;
 static NimBLECharacteristic* rscMeasurementChar = nullptr;  // Garmin RSC notify char
 
 // ── Treadmill data (written in callbacks, read in sendToWatch) ───────────────
-static uint16_t gRawSpeed    = 0;   // 0.01 km/h resolution (from FTMS 0x2ACD)
-static uint32_t gDistanceM   = 0;   // meters              (from FTMS 0x2ACD)
-static uint16_t gElapsedSec  = 0;   // seconds             (from FTMS 0x2ACD)
-
-static float    gCadence        = 0.0f; //Steps per minute (one leg)
-static uint32_t gLastDistanceM  = 0;
-static uint32_t gLastCadenceMs  = 0;
-
-static uint32_t gStepCount      = 0;  // cumulative total steps (survives mid-session overflows)
-static uint32_t gStepOffset     = 0;  // steps accumulated from past 10000-step overflows
-static uint16_t gLastRawSteps   = 0;  // last raw value from FitShow — used to detect overflow
-static uint32_t gZeroStepsStartMs = 0; // millis() when FitShow first reported 0 steps;
-                                        // if 0 for >60s → new session → reset counters
+static uint16_t gRawSpeed    = 0;    // 0.01 km/h resolution (from FTMS 0x2ACD)
+static uint32_t gDistanceM   = 0;    // meters               (from FTMS 0x2ACD)
+static uint16_t gElapsedSec  = 0;    // seconds              (from FTMS 0x2ACD)
+static uint8_t  gHeartrate   = 0;    // bpm                  (from FTMS 0x2ACD)
+static uint8_t  gPace        = 0;    // seconds per kilometer (from FTMS 0x2ACD)
+static float    gCadence     = 0.0f; // Steps per minute (one leg)
+static float    gCadenceFilt = 0.0f; // Filtered cadence for smoother RSC output
 
 // ── Forward declarations ─────────────────────────────────────────────────────
-void sendToWatch();
-bool connectToTreadmill();
+bool  connectToTreadmill();
+float estimateStrideLength(float speedKmh, float cadenceSpm);
 
-// =============================================================================
-// Watch notification — 9-byte packet over FTMS proxy
-//   Bytes 0-1: raw speed  (uint16 LE, 0.01 km/h)
-//   Bytes 2-4: distance   (uint24 LE, meters)
-//   Bytes 5-6: elapsed    (uint16 LE, seconds)
-//   Bytes 7-8: step count (uint16 LE, total steps)  ← added in BUILD 8 (option)
-// =============================================================================
-void sendToWatch() {
-    if (!watchConnected || p2acdChar == nullptr) return;
 
-    uint8_t pkt[9];
-    pkt[0] = (uint8_t)(gRawSpeed & 0xFF);
-    pkt[1] = (uint8_t)((gRawSpeed >> 8) & 0xFF);
-    pkt[2] = (uint8_t)(gDistanceM & 0xFF);
-    pkt[3] = (uint8_t)((gDistanceM >> 8) & 0xFF);
-    pkt[4] = (uint8_t)((gDistanceM >> 16) & 0xFF);
-    pkt[5] = (uint8_t)(gElapsedSec & 0xFF);
-    pkt[6] = (uint8_t)((gElapsedSec >> 8) & 0xFF);
-    // Steps sent as uint16 — max 65535, sufficient for any desk treadmill session
-    uint16_t stepsSend = (gStepCount > 0xFFFF) ? 0xFFFF : (uint16_t)gStepCount;
-    pkt[7] = (uint8_t)(stepsSend & 0xFF);
-    pkt[8] = (uint8_t)((stepsSend >> 8) & 0xFF);
+// ── Functions ───────────────────────────────────────────────────────────────
 
-    p2acdChar->setValue(pkt, sizeof(pkt));
-    p2acdChar->notify();
-}
+// Calculate stride length from speed and cadence.
+// Output: stride length in metres.
+float estimateStrideLength(float speedKmh, float cadenceSpm)
+{
+    if (cadenceSpm <= 0.0f)
+        return 0.0f;
 
-// Step length per speed: higher speed => longer step
-static float estimateStepLengthM(float speedKmh) {
-    speedKmh = constrain(speedKmh, 0.0f, 20.0f);
-
-    // Linear interpolation from slow pace speed to fast pace speed.
-    return SLOW_PACE_STEP_LENGTH_M + (speedKmh / MAX_SPEED_FOR_CADENCE) * (FAST_PACE_STEP_LENGTH_M - SLOW_PACE_STEP_LENGTH_M);
+    return (speedKmh * 1000.0f) /
+           (60.0f * cadenceSpm);
 }
 
 
-// Estimate cadence from treadmill speed and distance. Called every second when treadmill is running.
-static void updateCadenceEstimate(float speedKmh, uint32_t distanceM) {
-    uint32_t nowMs = millis();
+// Estimate cadence from treadmill speed based on scientific empirical data
+// Called every second when treadmill is running.
+void updateCadenceEstimate(float speedKmh) {
 
-    if (speedKmh <= 0.4f) {
+    // Default to 0 cadence if treadmill is stopped or speed is very low
+    if (speedKmh < 1.0f)
         gCadence = 0.0f;
-        gLastDistanceM = distanceM;
-        gLastCadenceMs = nowMs;
-        return;
+    // Walking: 1–6 km/h
+    else if (speedKmh <= 6.0f)
+        gCadence = 84.0f + 6.9f * speedKmh;
+    // Walking → running transition: 6–7 km/h
+    else if (speedKmh < 7.0f) {
+        gCadence = 125.4f + 36.29f * (speedKmh - 6.0f);
     }
+    // Running >= 7 km/h: cadence increases linearly with speed
+    else
+        gCadence = 150.0f + 1.67f * speedKmh;
 
-    float stepLenM = estimateStepLengthM(speedKmh);
-    float instantCadence = (speedKmh / 3.6f / stepLenM) * 60.0f;
-
-    // Extra smoothing, especially for low speeds where cadence can jump around a lot.
-    if (gCadence <= 0.0f) {
-        gCadence = instantCadence;
-    } else {
-        gCadence = gCadence * 0.6f + instantCadence * 0.4f;
-    }
-
-    gCadence = constrain(gCadence, 0.0f, 220.0f);
-    gLastDistanceM = distanceM;
-    gLastCadenceMs = nowMs;
+    // Constrain cadence to a reasonable range
+    gCadence = constrain(gCadence, 0.0f, 200.0f);
+    // Apply filter to smooth cadence changes
+    gCadenceFilt = CADENCE_FILTER * gCadence + (1.0f - CADENCE_FILTER) * gCadenceFilt;
 }
 
 
-// Send all RSC sensor data to the watch (speed, cadence, distance)
+// Notify all RSC sensor data to the watch (speed, cadence, distance)
 void sendRscMeasurement() {
     if (!rscMeasurementChar) {
         return;
@@ -151,7 +105,7 @@ void sendRscMeasurement() {
 
     // FTMS speed: 0.01 km/h
     float speedKmh = gRawSpeed * 0.01f;
-    updateCadenceEstimate(speedKmh, gDistanceM);
+    updateCadenceEstimate(speedKmh);
 
     // RSC speed: 1/256 m/s
     uint16_t speedRaw = (uint16_t)round((speedKmh / 3.6f) * 256.0f);
@@ -167,8 +121,8 @@ void sendRscMeasurement() {
     data[1] = speedRaw & 0xFF;
     data[2] = (speedRaw >> 8) & 0xFF;
 
-    // Filtered Cadence, constrained to 0-255 spm (one leg, so divide by 2 for RSC spec)
-    data[3] = (uint8_t)constrain(roundf(gCadence/2.0f), 0.0f, 255.0f);
+    // Send cadence rounded and converted to one leg, so divide by 2 for RSC spec
+    data[3] = (uint8_t)roundf(gCadenceFilt/2.0f);
 
     // Total Distance
     data[4] = distanceRaw & 0xFF;
@@ -223,13 +177,13 @@ bool parseTreadmillData(uint8_t* p, size_t len) {
     // Bit 4: Elevation Gain (positive + negative)
     if (flags & 0x0010) { readU16(); readU16(); }
     // Bit 5: Instantaneous Pace
-    if (flags & 0x0020) readU8();
+    if (flags & 0x0020) { gPace = readU8(); }
     // Bit 6: Average Pace
     if (flags & 0x0040) readU8();
     // Bit 7: Expended Energy (total + per hour + per minute)
     if (flags & 0x0080) { readU16(); readU16(); readU8(); }
     // Bit 8: Heart Rate
-    if (flags & 0x0100) readU8();
+    if (flags & 0x0100) { gHeartrate = readU8(); }
     // Bit 9: Metabolic Equivalent
     if (flags & 0x0200) readU8();
     // Bit 10: Elapsed Time
@@ -246,80 +200,16 @@ void onTreadmillData(NimBLERemoteCharacteristic* pChar,
 {
     if (!parseTreadmillData(pData, length)) return;
 
-    Serial.printf("[B%d][FTMS] spd=%.2f dst=%u t=%u steps=%u watch=%s\n",
+    Serial.printf("[B%d][FTMS] spd=%.2f dst=%u t=%u hr=%u pc=%u watch=%s\n",
         ESP32_BUILD,
         gRawSpeed * 0.01f,
         gDistanceM,
         gElapsedSec,
-        gStepCount,
+        gHeartrate,
+        gPace,
         watchConnected ? "OK" : "waiting");
-
-    sendToWatch();
 }
 
-// =============================================================================
-// FitShow 0xFFF1 callback — fires every second with live session data.
-// Packet layout (17 bytes, confirmed by log analysis):
-//   [00]     = 0x02  header
-//   [01]     = 0x51 or 0x04  subtype
-//   [02]     = unknown constant
-//   [03]     = uint8  speed x0.1 km/h
-//   [04]     = 0x00
-//   [05-06]  = uint16 LE  elapsed time (seconds)
-//   [07-08]  = uint16 LE  distance (meters)
-//   [09-10]  = uint16 LE  unknown
-//   [11-12]  = uint16 LE  step count (total) ← the field we want
-//   [13-14]  = uint16 LE  always 0x0000
-//   [15]     = uint8  checksum
-//   [16]     = 0x03  end marker
-// =============================================================================
-void onFitShowData(NimBLERemoteCharacteristic* pChar,
-                   uint8_t* pData, size_t length, bool isNotify)
-{
-    if (length < 13) {
-        // Short packets (5-6 bytes) appear after session ends — different packet type, ignored.
-        return;
-    }
-
-    // Extract step count from bytes 11-12 (uint16 little-endian)
-    uint16_t rawSteps = (uint16_t)pData[11] | ((uint16_t)pData[12] << 8);
-
-    // 60-second zero-step timeout → new session, reset all step state.
-    // This fires when the treadmill is stopped and stays at 0 for a full minute.
-    // It handles the case where the treadmill keeps BLE up between sessions
-    // (so BLE disconnect never resets the offset).
-    if (rawSteps == 0) {
-        if (gZeroStepsStartMs == 0) {
-            gZeroStepsStartMs = millis();  // start timing
-        } else if (millis() - gZeroStepsStartMs > 60000) {
-            // 60s of zeros confirmed — start fresh
-            gStepOffset = 0; gLastRawSteps = 0; gStepCount = 0; gZeroStepsStartMs = 0;
-            Serial.printf("[B%d][FITSHOW] 60s zero — new session, counter reset.\n", ESP32_BUILD);
-            sendToWatch();
-        }
-        return;  // don't update step count while at 0
-    }
-
-    // rawSteps > 0: cancel the zero timer
-    gZeroStepsStartMs = 0;
-
-    // Detect mid-session overflow: treadmill resets counter to 0 after 10000 steps.
-    // A drop of more than 500 from the last known value means an overflow occurred.
-    if (rawSteps + 500 < gLastRawSteps) {
-        gStepOffset += gLastRawSteps;
-        Serial.printf("[B%d][FITSHOW] *** Overflow! offset now=%u ***\n",
-            ESP32_BUILD, gStepOffset);
-    }
-    gLastRawSteps = rawSteps;
-
-    uint32_t totalSteps = gStepOffset + rawSteps;
-    if (totalSteps != gStepCount) {
-        gStepCount = totalSteps;
-        Serial.printf("[B%d][FITSHOW] steps=%u (raw=%u offset=%u)\n",
-            ESP32_BUILD, gStepCount, rawSteps, gStepOffset);
-        sendToWatch();
-    }
-}
 
 // =============================================================================
 // GATT Server callbacks — watch (RSC sensor) connects/disconnects
@@ -351,12 +241,9 @@ class TreadmillClientCallbacks : public NimBLEClientCallbacks {
         treadmillConnected = false;
 
         // Reset FTMS data so watch shows zeros (= treadmill offline).
-        // gStepCount stays frozen at last value for display.
-        // gStepOffset/gLastRawSteps are NOT reset here — new-session detection
-        // is time-based (60s zero) in onFitShowData, not BLE-disconnect-based.
-        gRawSpeed = 0; gDistanceM = 0; gElapsedSec = 0;
-        sendToWatch();
-
+        gRawSpeed = 0; gCadence = 0.0f; gCadenceFilt = 0.0f;
+        sendRscMeasurement();
+        
         // Restart scanning to find treadmill again
         NimBLEDevice::getScan()->start(0, nullptr, false);
     }
@@ -455,85 +342,9 @@ bool connectToTreadmill() {
 
     Serial.printf("[B%d][FTMS] Subscribed to 0x2ACD. Data flowing.\n", ESP32_BUILD);
 
-    // ── FitShow 0xFFF1 — live step count ─────────────────────────────────
-    // Fires every second during session. Bytes 11-12 = total step count.
-    NimBLERemoteService* pFitShowSvc = pClient->getService(FITSHOW_SERVICE_UUID);
-    if (pFitShowSvc) {
-        NimBLERemoteCharacteristic* pFitShowChar =
-            pFitShowSvc->getCharacteristic(FITSHOW_NOTIFY_CHAR_UUID);
-        if (pFitShowChar && pFitShowChar->canNotify()) {
-            pFitShowChar->subscribe(true, onFitShowData);
-            NimBLERemoteDescriptor* pFitShowCCCD =
-                pFitShowChar->getDescriptor(NimBLEUUID(CCCD_UUID));
-            if (pFitShowCCCD) {
-                uint8_t v[] = {0x01, 0x00};
-                pFitShowCCCD->writeValue(v, 2, true);
-                Serial.printf("[B%d][FITSHOW] Subscribed to 0xFFF1. Step count active.\n",
-                    ESP32_BUILD);
-            } else {
-                Serial.printf("[B%d][FITSHOW] WARNING: 0xFFF1 CCCD not found. Subscribed anyway.\n",
-                    ESP32_BUILD);
-            }
-        } else {
-            Serial.printf("[B%d][FITSHOW] WARNING: 0xFFF1 not found or not notifiable.\n",
-                ESP32_BUILD);
-        }
-    } else {
-        Serial.printf("[B%d][FITSHOW] WARNING: FitShow service 0xFFF0 not found.\n",
-            ESP32_BUILD);
-    }
-
     return true;
 }
 
-// =============================================================================
-// GATT Server setup — FTMS proxy for CIQ DataField on the watch
-// =============================================================================
-#if 0
-void setupFtmsProxyServer() {
-    NimBLEServer* pServer = NimBLEDevice::createServer();
-    pServer->setCallbacks(new ServerCallbacks());
-
-    // ── RSC service — Garmin sensor interface ─────────────────────────────
-    NimBLEService* pRscSvc =
-    pServer->createService(RSC_SERVICE_UUID);
-
-    rscMeasurementChar = pRscSvc->createCharacteristic(
-    RSC_MEASUREMENT_UUID,
-    NIMBLE_PROPERTY::NOTIFY
-    );
-
-pRscSvc->start();
-#if 0
-    NimBLEService* pSvc = pServer->createService(FTMS_SERVICE_UUID);
-    p2acdChar = pSvc->createCharacteristic(
-        TREADMILL_DATA_CHAR_UUID,
-        NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ
-    );
-
-    // Initial value: 9 bytes of zeros (no data yet)
-    uint8_t zero[9] = {0};
-    p2acdChar->setValue(zero, 9);
-    pSvc->start();
-#endif
-
-    // Advertise FTMS UUID so CIQ scan finds us via getServiceUuids()
-    NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
-    //pAdv->addServiceUUID(NimBLEUUID(FTMS_SERVICE_UUID));
-    pAdv->addServiceUUID(NimBLEUUID(RSC_SERVICE_UUID));
-
-    // "TreadBLE" = 8 chars — fits in BLE scan response without truncation.
-    // Longer names (e.g. "TreadmillBridge") get truncated to ~8 chars by the stack.
-    NimBLEAdvertisementData scanResp;
-    scanResp.setName("TreadBLE");
-    pAdv->setScanResponseData(scanResp);
-
-    pAdv->start();
-
-    Serial.printf("[B%d][GATT] FTMS proxy started. Address: %s\n",
-        ESP32_BUILD, NimBLEDevice::getAddress().toString().c_str());
-}
-#endif
 
 // =============================================================================
 // GATT Server setup — Running, Speed and Cadence (RSC) sensor for Garmin
@@ -621,7 +432,7 @@ void setup() {
     pScan->setInterval(100);
     pScan->setWindow(99);
 
-    Serial.printf("[B%d][SCAN] Scanning for treadmill...\n",
+    Serial.printf("[B%d][SCAN] Scanning for treadmill and watch...\n",
         ESP32_BUILD);
     pScan->start(0, nullptr, false);
 }
@@ -639,7 +450,14 @@ static uint32_t lastRsc = 0;
     } else {
         if (treadmillConnected) {
             // Blink LED 0.5 Hz when treadmill connected but watch not connected
-            if (millis() % 1000 < 500) {
+            if (millis() % 1000 < 800) {
+                digitalWrite(LED_PIN, HIGH);
+            } else {
+                digitalWrite(LED_PIN, LOW);
+            }
+        } else if (watchConnected) {
+            // Blink LED 0.5 Hz asynchronously when watch connected but treadmill not connected
+            if (millis() % 1000 < 200) {
                 digitalWrite(LED_PIN, HIGH);
             } else {
                 digitalWrite(LED_PIN, LOW);
@@ -666,7 +484,7 @@ static uint32_t lastRsc = 0;
                 ESP32_BUILD,
                 gRawSpeed * 0.01f,
                 (unsigned long)gDistanceM,
-                (uint16_t)constrain(roundf(gCadence), 0.0f, 255.0f)
+                (uint16_t)(roundf(gCadence))
             );
         }
     }
