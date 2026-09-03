@@ -20,8 +20,14 @@
 
 // ── Build configuration ─────────────────────────────────────────────────────
 #define ESP32_BUILD     14
-#define LED_PIN         8
-#define CADENCE_FILTER  0.2f  // Low-pass filter alpha for cadence smoothing
+#define DEBUG           0     // Set to 1 to enable detailed debug prints (very verbose)
+#define LED_PIN         8     // Blue LED pin on ESP32-C3 SuperMini board (active LOW)
+#define LED_ON          LOW   // Led is active LOW on ESP32-C3 SuperMini board
+#define LED_OFF         HIGH  // Led off is HIGH on ESP32-C3 SuperMini board
+#define CADENCE_FILTER  0.8f  // Filter or cadence smoothing, 0.8 of the new value
+#define VIBRATION_PIN   3     // Pin for vibration sensor (optional)
+#define DEBOUNCE_TIME   250   // Debounce time in milliseconds for vibration sensor
+#define SENSOR_TIMEOUT  1500  // Timeout in milliseconds for sensor data
 
 // ── Garmin RSC (Running Speed and Cadence) UUIDs ─────────────────────────
 #define RSC_SERVICE_UUID         "1814"
@@ -45,18 +51,31 @@ static volatile bool         watchConnected     = false;
 static NimBLECharacteristic* rscMeasurementChar = nullptr;  // Garmin RSC notify char
 
 // ── Treadmill data (written in callbacks, read in sendToWatch) ───────────────
-static uint16_t gRawSpeed    = 0;    // 0.01 km/h resolution (from FTMS 0x2ACD)
-static uint32_t gDistanceM   = 0;    // meters               (from FTMS 0x2ACD)
-static uint16_t gElapsedSec  = 0;    // seconds              (from FTMS 0x2ACD)
-static uint8_t  gHeartrate   = 0;    // bpm                  (from FTMS 0x2ACD)
+static uint16_t gRawSpeed    = 0;    // 0.01 km/h resolution  (from FTMS 0x2ACD)
+static uint32_t gDistanceM   = 0;    // meters                (from FTMS 0x2ACD)
+static uint16_t gElapsedSec  = 0;    // seconds               (from FTMS 0x2ACD)
+static uint8_t  gHeartrate   = 0;    // bpm                   (from FTMS 0x2ACD)
 static uint8_t  gPace        = 0;    // seconds per kilometer (from FTMS 0x2ACD)
+static uint8_t  gEnergy      = 0;    // Energy kcal / min     (from FTMS 0x2ACD)
+
+// ── Cadence estimation (from treadmill speed) ───────────────────────────────
 static float    gCadence     = 0.0f; // Steps per minute (one leg)
 static float    gCadenceFilt = 0.0f; // Filtered cadence for smoother RSC output
+// ── Vibration sensor (optional) ─────────────────────────────────────────────
+static volatile unsigned long lastStepTime    = 0;      // Last vibration pulse time in milliseconds
+static volatile unsigned long pulseTimePassed = 0;     // Vibration pulse time
+static volatile float         sensorCadence   = 0.0f;  // Calculated cadence from vibration sensor (steps per minute)
+// Global lock for ISR and main loop access to vibration sensor data (lastStepTime, pulseTimePassed, sensorCadence)
+static portMUX_TYPE vibrationMux = portMUX_INITIALIZER_UNLOCKED;
 
-// ── Forward declarations ─────────────────────────────────────────────────────
-bool  connectToTreadmill();
+// ── Forward declarations, funtion prototypes ────────────────────────────────
 float estimateStrideLength(float speedKmh, float cadenceSpm);
-
+void  updateCadenceEstimate(float speedKmh);
+void  sendRscMeasurement();
+bool  parseTreadmillData(uint8_t* p, size_t len);
+void  onTreadmillData(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify);
+bool  connectToTreadmill();
+void  setupFtmsProxyServer();
 
 // ── Functions ───────────────────────────────────────────────────────────────
 
@@ -73,7 +92,7 @@ float estimateStrideLength(float speedKmh, float cadenceSpm)
 
 
 // Estimate cadence from treadmill speed based on scientific empirical data
-// Called every second when treadmill is running.
+// Called every second when treadmill is running and no cadence sensor data
 void updateCadenceEstimate(float speedKmh) {
 
     // Default to 0 cadence if treadmill is stopped or speed is very low
@@ -92,36 +111,53 @@ void updateCadenceEstimate(float speedKmh) {
 
     // Constrain cadence to a reasonable range
     gCadence = constrain(gCadence, 0.0f, 200.0f);
-    // Apply filter to smooth cadence changes
-    gCadenceFilt = CADENCE_FILTER * gCadence + (1.0f - CADENCE_FILTER) * gCadenceFilt;
-}
+ }
 
 
+// ============================================================================
 // Notify all RSC sensor data to the watch (speed, cadence, distance)
+// ============================================================================
 void sendRscMeasurement() {
+    uint8_t data[8];
+    float speedKmh;
+    uint16_t speedRaw;
+    uint32_t distanceRaw;
+
     if (!rscMeasurementChar) {
         return;
     }
 
     // FTMS speed: 0.01 km/h
-    float speedKmh = gRawSpeed * 0.01f;
+    speedKmh = gRawSpeed * 0.01f;
+    
+    // Calculate the estimated cadence based on treadmill speed
     updateCadenceEstimate(speedKmh);
+    // If we have a vibration sensor, use its cadence instead of the estimated one
+    portENTER_CRITICAL(&vibrationMux);
+    sensorCadence = (pulseTimePassed > 0) ? (60000.0f / pulseTimePassed) : 0.0f;
+    portEXIT_CRITICAL(&vibrationMux);
 
     // RSC speed: 1/256 m/s
-    uint16_t speedRaw = (uint16_t)round((speedKmh / 3.6f) * 256.0f);
+    speedRaw = (uint16_t)round((speedKmh / 3.6f) * 256.0f);
     // RSC total distance: 0.1 meter
-    uint32_t distanceRaw = gDistanceM * 10;
+    distanceRaw = gDistanceM * 10;
 
-    uint8_t data[8];
-
-    // Flags: Instantaneous Speed, Cadence and Total Distance Present
-    data[0] = 0x15;
+    // Flags: 0x06 = Total distance is present, Running flag on
+    data[0] = 0x06;
 
     // Instantaneous Speed
     data[1] = speedRaw & 0xFF;
     data[2] = (speedRaw >> 8) & 0xFF;
 
-    // Send cadence rounded and converted to one leg, so divide by 2 for RSC spec
+    // Check if we have Cadence from the sensor input or need to estimate 
+    if (sensorCadence > 0.0f) {
+        // Apply filter to smooth cadence changes
+        gCadenceFilt = CADENCE_FILTER * sensorCadence + (1.0f - CADENCE_FILTER) * gCadenceFilt;
+    } else {
+        // Apply filter to smooth cadence changes
+        gCadenceFilt = CADENCE_FILTER * gCadence + (1.0f - CADENCE_FILTER) * gCadenceFilt;
+    }
+    // Send the cadence estimated from treadmill speed (one leg, steps per minute)
     data[3] = (uint8_t)roundf(gCadenceFilt/2.0f);
 
     // Total Distance
@@ -181,7 +217,7 @@ bool parseTreadmillData(uint8_t* p, size_t len) {
     // Bit 6: Average Pace
     if (flags & 0x0040) readU8();
     // Bit 7: Expended Energy (total + per hour + per minute)
-    if (flags & 0x0080) { readU16(); readU16(); readU8(); }
+    if (flags & 0x0080) { readU16(); readU16(); gEnergy = readU8(); }
     // Bit 8: Heart Rate
     if (flags & 0x0100) { gHeartrate = readU8(); }
     // Bit 9: Metabolic Equivalent
@@ -200,13 +236,13 @@ void onTreadmillData(NimBLERemoteCharacteristic* pChar,
 {
     if (!parseTreadmillData(pData, length)) return;
 
-    Serial.printf("[B%d][FTMS] spd=%.2f dst=%u t=%u hr=%u pc=%u watch=%s\n",
+    Serial.printf("[B%d][FTMS] spd=%.2f dst=%u t=%u hr=%u kcal=%u watch=%s\n",
         ESP32_BUILD,
         gRawSpeed * 0.01f,
         gDistanceM,
         gElapsedSec,
         gHeartrate,
-        gPace,
+        gEnergy,
         watchConnected ? "OK" : "waiting");
 }
 
@@ -293,6 +329,10 @@ bool connectToTreadmill() {
     }
 
     pClient = NimBLEDevice::createClient();
+    if (pClient == nullptr) {
+        Serial.printf("[B%d][FTMS] Unable to create client.\n", ESP32_BUILD);
+        return false;
+    }
     pClient->setClientCallbacks(new TreadmillClientCallbacks(), true);
     pClient->setConnectTimeout(5);  // 5 seconds — prevents infinite hang
 
@@ -405,6 +445,29 @@ void setupFtmsProxyServer() {
     );
 }
 
+// =============================================================================
+// Background interrupt service routine for vibration sensor (optional)
+// Calculates cadence based on time between vibration pulses (one pulse per step)
+// =============================================================================
+void IRAM_ATTR onVibrationDetected() {
+    unsigned long currentmillis = millis();
+
+    portENTER_CRITICAL_ISR(&vibrationMux);
+    unsigned long elapsed = currentmillis - lastStepTime;
+
+    // Check on first pulse to initialize lastStepTime
+    if (lastStepTime == 0) {
+        lastStepTime = currentmillis;
+    }
+   // Filter out micro-vibrations/chatter from a single impact
+    else if (elapsed > DEBOUNCE_TIME) {
+        pulseTimePassed = elapsed;  // Update only for valid pulse
+        lastStepTime = currentmillis;
+    }
+
+    portEXIT_CRITICAL_ISR(&vibrationMux);
+}
+
 
 // =============================================================================
 // setup() — runs once at boot
@@ -419,6 +482,9 @@ void setup() {
     Serial.println("================================================");
     Serial.printf( "=== Treadmill BLE Bridge ESP32 BUILD %d      ===\n", ESP32_BUILD);
     Serial.println("================================================");
+
+    pinMode(VIBRATION_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(VIBRATION_PIN), onVibrationDetected, FALLING);
 
     NimBLEDevice::init("TreadBLE");
 
@@ -446,31 +512,41 @@ static uint32_t lastRsc = 0;
     // First handle the LED state based on connection status. This gives immediate visual feedback.
     if (watchConnected && treadmillConnected) {
         // Solid LED when watch and treadmill are connected
-        digitalWrite(LED_PIN, LOW);
+        digitalWrite(LED_PIN, LED_ON);
     } else {
         if (treadmillConnected) {
-            // Blink LED 0.5 Hz when treadmill connected but watch not connected
+            // Blink LED 1 Hz asynchronously when treadmill connected but watch not connected
             if (millis() % 1000 < 800) {
-                digitalWrite(LED_PIN, HIGH);
+                digitalWrite(LED_PIN, LED_OFF);
             } else {
-                digitalWrite(LED_PIN, LOW);
+                digitalWrite(LED_PIN, LED_ON);
             }
         } else if (watchConnected) {
-            // Blink LED 0.5 Hz asynchronously when watch connected but treadmill not connected
+            // Blink LED 1 Hz asynchronously when treadmill connected but watch not connected
             if (millis() % 1000 < 200) {
-                digitalWrite(LED_PIN, HIGH);
+                digitalWrite(LED_PIN, LED_OFF);
             } else {
-                digitalWrite(LED_PIN, LOW);
+                digitalWrite(LED_PIN, LED_ON);
             }
         } else {
             // Blink Led really fast when both treadmill and watch not connected
             if (millis() % 200 < 100) {
-                digitalWrite(LED_PIN, HIGH);
+                digitalWrite(LED_PIN, LED_OFF);
             } else {
-                digitalWrite(LED_PIN, LOW);
+                digitalWrite(LED_PIN, LED_ON);
             }
         }
     }
+
+    // Check for sensor timeouts to reset to 0 cadence if no vibration pulses are detected for a while
+    portENTER_CRITICAL(&vibrationMux);
+    if (lastStepTime > 0 && (millis() - lastStepTime > SENSOR_TIMEOUT)) {
+        lastStepTime = 0;
+        pulseTimePassed = 0;
+        sensorCadence = 0.0f;
+        gCadenceFilt = 0.0f;
+    }
+    portEXIT_CRITICAL(&vibrationMux);
 
     // Send RSC measurement to watch every second if connected
     if (millis() - lastRsc >= 1000) {
@@ -484,7 +560,7 @@ static uint32_t lastRsc = 0;
                 ESP32_BUILD,
                 gRawSpeed * 0.01f,
                 (unsigned long)gDistanceM,
-                (uint16_t)(roundf(gCadence))
+                (uint16_t)(roundf(gCadenceFilt))
             );
         }
     }
@@ -499,6 +575,8 @@ static uint32_t lastRsc = 0;
             NimBLEDevice::getScan()->start(0, nullptr, false);
         }
     }
+    
+    // Delay a bit to avoid busy looping and allow other tasks to run
     delay(10);
 }
  
