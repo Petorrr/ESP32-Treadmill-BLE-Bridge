@@ -1,6 +1,12 @@
 // main.cpp — ESP32 Treadmill BLE Bridge BUILD 14
 // Changes from BUILD 13:
-//
+//      Added a BLE name TreadBLE-XXXX where XXXX is the last 4 digits of the ESP32 MAC address
+//      Added support for optional vibration sensor to detect steps and calculate cadence
+//      Cadence calculation first looks for vibration sensor input, if none, falls back to cadence estimation from treadmill speed
+//      On battery power, it is essential to go to deep sleep after 10 mins of inactivity (both treadmill and watch disconnected)
+//      Added GPIO wakeup from deep sleep on vibration sensor pin (optional), otherwise reset or power cycle is needed
+//      Fixed LED blinking logic to reflect connection status more accurately
+//      Minor code cleanup and comments
 
 // main.cpp — ESP32 Treadmill BLE Bridge BUILD 13
 // Changes from BUILD 12:
@@ -20,20 +26,26 @@
 
 // ── Build configuration ─────────────────────────────────────────────────────
 #define ESP32_BUILD     14
-#define DEBUG           0     // Set to 1 to enable detailed debug prints (very verbose)
 #define LED_PIN         8     // Blue LED pin on ESP32-C3 SuperMini board (active LOW)
 #define LED_ON          LOW   // Led is active LOW on ESP32-C3 SuperMini board
 #define LED_OFF         HIGH  // Led off is HIGH on ESP32-C3 SuperMini board
-#define CADENCE_FILTER  0.8f  // Filter or cadence smoothing, 0.8 of the new value
+
+// ── Cadence sensor detection and smoothing ─────────────────────────────────────────
+#define CADENCE_SENSOR  0     // Set to 1 to enable vibration sensor for cadence detection, 0 to disable
+#define CADENCE_FILTER  0.5f  // Filter or cadence smoothing, 0.5 of the new value
 #define VIBRATION_PIN   3     // Pin for vibration sensor (optional)
 #define DEBOUNCE_TIME   250   // Debounce time in milliseconds for vibration sensor
-#define SENSOR_TIMEOUT  1500  // Timeout in milliseconds for sensor data
+#define SENSOR_TIMEOUT  3000  // Timeout in milliseconds for sensor data
+#define INACTIVITY_TIME 600000UL // 10 minutes
 
 // ── Garmin RSC (Running Speed and Cadence) UUIDs ─────────────────────────
 #define RSC_SERVICE_UUID         "1814"
 #define RSC_MEASUREMENT_UUID     "2A53"
 #define RSC_FEATURE_UUID         "2A54"
 #define RSC_SENSOR_LOCATION_UUID "2A5D"
+
+// ── BLE device name for Garmin RSC ───────────────────────────────────────
+static char deviceName[16] = "TreadBLE-0000";
 
 // ── BLE UUIDs ────────────────────────────────────────────────────────────────
 static const char* FTMS_SERVICE_UUID        = "00001826-0000-1000-8000-00805f9b34fb";
@@ -50,6 +62,9 @@ static volatile bool         treadmillConnected = false;
 static volatile bool         watchConnected     = false;
 static NimBLECharacteristic* rscMeasurementChar = nullptr;  // Garmin RSC notify char
 
+// ── Inactivity timer ───────────────────────────────────────────────────────
+static volatile unsigned long lastActivityTime = 0;
+
 // ── Treadmill data (written in callbacks, read in sendToWatch) ───────────────
 static uint16_t gRawSpeed    = 0;    // 0.01 km/h resolution  (from FTMS 0x2ACD)
 static uint32_t gDistanceM   = 0;    // meters                (from FTMS 0x2ACD)
@@ -62,9 +77,10 @@ static uint8_t  gEnergy      = 0;    // Energy kcal / min     (from FTMS 0x2ACD)
 static float    gCadence     = 0.0f; // Steps per minute (one leg)
 static float    gCadenceFilt = 0.0f; // Filtered cadence for smoother RSC output
 // ── Vibration sensor (optional) ─────────────────────────────────────────────
-static volatile unsigned long lastStepTime    = 0;      // Last vibration pulse time in milliseconds
+static volatile unsigned long lastStepTime    = 0;     // Last vibration pulse time in milliseconds
 static volatile unsigned long pulseTimePassed = 0;     // Vibration pulse time
 static volatile float         sensorCadence   = 0.0f;  // Calculated cadence from vibration sensor (steps per minute)
+static volatile bool          cadenceTimedOut = false; // Flag to indicate if cadence has timed out
 // Global lock for ISR and main loop access to vibration sensor data (lastStepTime, pulseTimePassed, sensorCadence)
 static portMUX_TYPE vibrationMux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -132,10 +148,13 @@ void sendRscMeasurement() {
     
     // Calculate the estimated cadence based on treadmill speed
     updateCadenceEstimate(speedKmh);
+    
+ #if CADENCE_SENSOR == 1
     // If we have a vibration sensor, use its cadence instead of the estimated one
     portENTER_CRITICAL(&vibrationMux);
     sensorCadence = (pulseTimePassed > 0) ? (60000.0f / pulseTimePassed) : 0.0f;
     portEXIT_CRITICAL(&vibrationMux);
+#endif
 
     // RSC speed: 1/256 m/s
     speedRaw = (uint16_t)round((speedKmh / 3.6f) * 256.0f);
@@ -150,9 +169,12 @@ void sendRscMeasurement() {
     data[2] = (speedRaw >> 8) & 0xFF;
 
     // Check if we have Cadence from the sensor input or need to estimate 
-    if (sensorCadence > 0.0f) {
+    if (sensorCadence > 0.0f || cadenceTimedOut) {
         // Apply filter to smooth cadence changes
         gCadenceFilt = CADENCE_FILTER * sensorCadence + (1.0f - CADENCE_FILTER) * gCadenceFilt;
+        // Check to reset timeout flag if we filtered cadence below threshold --> Resume simulation from treadmill speed
+        if (gCadenceFilt < 1.0f && cadenceTimedOut)
+            cadenceTimedOut = false;
     } else {
         // Apply filter to smooth cadence changes
         gCadenceFilt = CADENCE_FILTER * gCadence + (1.0f - CADENCE_FILTER) * gCadenceFilt;
@@ -433,7 +455,7 @@ void setupFtmsProxyServer() {
     pAdv->addServiceUUID(NimBLEUUID(RSC_SERVICE_UUID));
 
     NimBLEAdvertisementData scanResp;
-    scanResp.setName("TreadBLE");
+    scanResp.setName(deviceName);
     pAdv->setScanResponseData(scanResp);
 
     pAdv->start();
@@ -463,9 +485,20 @@ void IRAM_ATTR onVibrationDetected() {
     else if (elapsed > DEBOUNCE_TIME) {
         pulseTimePassed = elapsed;  // Update only for valid pulse
         lastStepTime = currentmillis;
+        cadenceTimedOut = false;  // Reset timeout flag on valid pulse
     }
 
     portEXIT_CRITICAL_ISR(&vibrationMux);
+}
+
+// =============================================================================
+// Prepare for deep sleep — deinit BLE, enable GPIO wakeup, and enter deep sleep
+// =============================================================================
+void prepareForDeepSleep() {
+    NimBLEDevice::deinit(true);
+
+    esp_deep_sleep_enable_gpio_wakeup(1ULL << VIBRATION_PIN, ESP_GPIO_WAKEUP_GPIO_LOW);
+    esp_deep_sleep_start();
 }
 
 
@@ -474,6 +507,7 @@ void IRAM_ATTR onVibrationDetected() {
 // =============================================================================
 void setup() {
     pinMode(LED_PIN, OUTPUT);
+    lastActivityTime = 0l;
 
     Serial.begin(115200);
     delay(1000);
@@ -486,7 +520,8 @@ void setup() {
     pinMode(VIBRATION_PIN, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(VIBRATION_PIN), onVibrationDetected, FALLING);
 
-    NimBLEDevice::init("TreadBLE");
+    snprintf(deviceName, sizeof(deviceName), "TreadBLE-%04X", (uint16_t)(ESP.getEfuseMac() & 0xFFFF));
+    NimBLEDevice::init(deviceName);
 
     // Start GATT server first — watch can connect anytime
     setupFtmsProxyServer();
@@ -498,8 +533,7 @@ void setup() {
     pScan->setInterval(100);
     pScan->setWindow(99);
 
-    Serial.printf("[B%d][SCAN] Scanning for treadmill and watch...\n",
-        ESP32_BUILD);
+    Serial.printf("[B%d][SCAN] Scanning for treadmill and watch (%s)...\n", ESP32_BUILD, deviceName);
     pScan->start(0, nullptr, false);
 }
 
@@ -538,15 +572,29 @@ static uint32_t lastRsc = 0;
         }
     }
 
+    // Inactivity timer: if both treadmill and watch are disconnected for a long time, prepare for deep sleep
+    if (treadmillConnected || watchConnected) {
+        // Reset inactivity timer when either treadmill or watch or both are connected
+        lastActivityTime = millis(); 
+    }
+    else {
+        // Both treadmill and watch are disconnected, check for long inactivity
+        if (millis() - lastActivityTime >= INACTIVITY_TIME) {
+            prepareForDeepSleep();
+        }
+    }
+
+ #if CADENCE_SENSOR == 1
     // Check for sensor timeouts to reset to 0 cadence if no vibration pulses are detected for a while
     portENTER_CRITICAL(&vibrationMux);
     if (lastStepTime > 0 && (millis() - lastStepTime > SENSOR_TIMEOUT)) {
         lastStepTime = 0;
         pulseTimePassed = 0;
         sensorCadence = 0.0f;
-        gCadenceFilt = 0.0f;
+        cadenceTimedOut = true;
     }
     portEXIT_CRITICAL(&vibrationMux);
+#endif
 
     // Send RSC measurement to watch every second if connected
     if (millis() - lastRsc >= 1000) {
@@ -563,6 +611,11 @@ static uint32_t lastRsc = 0;
                 (uint16_t)(roundf(gCadenceFilt))
             );
         }
+        // If both treadmill and watch are disconnected, print inactivity time for debugging
+        else if (!treadmillConnected) {
+            Serial.printf("[B%d][SCAN] Inactivity %lu s\n", ESP32_BUILD, (millis() - lastActivityTime) / 1000);
+        }
+        
     }
 
     // doConnect is set by ScanCallbacks::onResult() in the NimBLE task.
